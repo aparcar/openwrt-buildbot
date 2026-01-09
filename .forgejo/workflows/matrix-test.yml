@@ -1,0 +1,33 @@
+name: Matrix Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  matrix-generator:
+    runs-on: docker
+    outputs:
+      variants: ${{ steps.generate_matrix.outputs.variants }}
+      nodes: ${{ steps.generate_matrix.outputs.nodes }}
+    steps:
+      - id: generate_matrix
+        run: |
+          echo 'variants=["bookworm", "bullseye"]' >> $GITHUB_OUTPUT
+          echo 'nodes=["18", "20"]' >> $GITHUB_OUTPUT
+
+  test:
+    needs: matrix-generator
+    runs-on: docker
+    strategy:
+      matrix:
+        variant: ${{ fromJSON(needs.matrix-generator.outputs.variants) }}
+        node: ${{ fromJSON(needs.matrix-generator.outputs.nodes) }}
+    container:
+      image: debian:${{ matrix.variant }}
+    steps:
+      - uses: https://code.forgejo.org/actions/setup-node@v4
+        with:
+          node-version: '${{ matrix.node }}'
+      - run: |
+          echo "Testing variant=${{ matrix.variant }} node=${{ matrix.node }}"
+          node --version

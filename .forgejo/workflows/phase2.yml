@@ -20,7 +20,7 @@ on:
         default: 'main'
 
 env:
-  OPENWRT_REPO: https://git.openwrt.org/openwrt/openwrt.git
+  OPENWRT_REPO: https://codeberg.org/openwrt/openwrt.git
   OPENWRT_BRANCH: ${{ inputs.openwrt_branch || 'main' }}
   DOWNLOAD_BASE: https://downloads.openwrt.org/snapshots/targets
 
@@ -84,7 +84,6 @@ jobs:
 
   build-packages:
     name: Build ${{ matrix.target_combo }}
-    needs: discover-targets
     runs-on: docker
     strategy:
       matrix:
@@ -142,7 +141,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y jq
+          apt-get install -y jq zstd
 
       - name: Checkout buildbot repo
         uses: actions/checkout@v4

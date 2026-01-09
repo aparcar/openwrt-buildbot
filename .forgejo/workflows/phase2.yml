@@ -27,10 +27,15 @@ env:
 jobs:
   discover-targets:
     name: Discover build targets
-    runs-on: self-hosted
+    runs-on: docker
     outputs:
       architectures: ${{ steps.get-arches.outputs.architectures }}
     steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y jq
+
       - name: Checkout buildbot repo
         uses: actions/checkout@v4
 
@@ -74,7 +79,7 @@ jobs:
   build-packages:
     name: Build ${{ matrix.arch.arch }}
     needs: discover-targets
-    runs-on: self-hosted
+    runs-on: docker
     strategy:
       matrix:
         arch: ${{ fromJson(needs.discover-targets.outputs.architectures) }}
@@ -87,6 +92,11 @@ jobs:
       SUBTARGET: ${{ matrix.arch.subtarget }}
 
     steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y jq
+
       - name: Checkout buildbot repo
         uses: actions/checkout@v4
 

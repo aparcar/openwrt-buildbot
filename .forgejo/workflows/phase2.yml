@@ -59,10 +59,12 @@ jobs:
           ./scripts/dump-target-info.pl architectures > tmp/architectures.txt
 
           # Convert to JSON array for matrix
-          # Format: [{"arch": "aarch64_cortex-a53", "target": "qualcommax", "subtarget": "ipq807x"}, ...]
+          # Format: ["target:subtarget:arch", ...]
+          # We combine into a single string because matrix doesn't support complex objects
+          # Use colon separator to avoid conflicts with dashes in names
           ARCHES_JSON=$(awk '{
             split($2, ts, "/");
-            printf "{\"arch\": \"%s\", \"target\": \"%s\", \"subtarget\": \"%s\"}\n", $1, ts[1], ts[2]
+            printf "\"%s:%s:%s\"\n", ts[1], ts[2], $1
           }' tmp/architectures.txt | jq -s -c '.')
 
           echo "Found architectures:"
@@ -70,28 +72,38 @@ jobs:
 
           # Filter if specific architecture requested
           if [ "${{ inputs.architecture }}" != "all" ] && [ -n "${{ inputs.architecture }}" ]; then
-            ARCHES_JSON=$(echo "$ARCHES_JSON" | jq -c '[.[] | select(.arch == "${{ inputs.architecture }}")]')
+            ARCHES_JSON=$(echo "$ARCHES_JSON" | jq -c --arg arch "${{ inputs.architecture }}" '[.[] | select(endswith(":" + $arch))]')
             echo "Filtered to: $ARCHES_JSON"
           fi
 
+          echo "Setting output architectures=$ARCHES_JSON"
           echo "architectures=$ARCHES_JSON" >> "$GITHUB_OUTPUT"
 
+          echo "Verifying output was set:"
+          cat "$GITHUB_OUTPUT"
+
   build-packages:
-    name: Build ${{ matrix.arch.arch }}
+    name: Build ${{ matrix.target_combo }}
     needs: discover-targets
     runs-on: docker
     strategy:
       matrix:
-        arch: ${{ fromJson(needs.discover-targets.outputs.architectures) }}
+        target_combo: ${{ fromJSON(needs.discover-targets.outputs.architectures) }}
       fail-fast: false
       max-parallel: 4
 
-    env:
-      ARCH: ${{ matrix.arch.arch }}
-      TARGET: ${{ matrix.arch.target }}
-      SUBTARGET: ${{ matrix.arch.subtarget }}
-
     steps:
+      - name: Parse target combination
+        id: parse
+        run: |
+          echo "Received target_combo: ${{ matrix.target_combo }}"
+          # Split target_combo into components: target:subtarget:arch
+          IFS=':' read -r TARGET SUBTARGET ARCH <<< "${{ matrix.target_combo }}"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "subtarget=$SUBTARGET" >> "$GITHUB_OUTPUT"
+          echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+          echo "Parsed: TARGET=$TARGET, SUBTARGET=$SUBTARGET, ARCH=$ARCH"
+
       - name: Install dependencies
         run: |
           apt-get update
@@ -102,13 +114,13 @@ jobs:
 
       - name: Prepare workspace
         run: |
-          echo "Building packages for $ARCH ($TARGET/$SUBTARGET)"
+          echo "Building packages for ${{ steps.parse.outputs.arch }} (${{ steps.parse.outputs.target }}/${{ steps.parse.outputs.subtarget }})"
           mkdir -p sdk
           mkdir -p "$HOME/dl"
 
       - name: Download SDK
         run: |
-          SDK_URL="${{ env.DOWNLOAD_BASE }}/${TARGET}/${SUBTARGET}"
+          SDK_URL="${{ env.DOWNLOAD_BASE }}/${{ steps.parse.outputs.target }}/${{ steps.parse.outputs.subtarget }}"
           echo "Looking for SDK at: $SDK_URL"
 
           # Find SDK filename
@@ -211,7 +223,7 @@ jobs:
 
       - name: Calculate checksums
         run: |
-          cd sdk/bin/packages/${ARCH}
+          cd sdk/bin/packages/${{ steps.parse.outputs.arch }}
           find . -type f -not -name 'sha256sums' -printf '%P\n' | \
             sort | \
             xargs -r ../../staging_dir/host/bin/mkhash -n sha256 | \
@@ -225,9 +237,9 @@ jobs:
           cd sdk
           # Create target directory structure
           rsync -4 -v --timeout=120 -a \
-            --include "/${ARCH}/" \
+            --include "/${{ steps.parse.outputs.arch }}/" \
             --exclude "/*" \
-            --exclude "/${ARCH}/*" \
+            --exclude "/${{ steps.parse.outputs.arch }}/*" \
             bin/packages/ \
             "${{ vars.RSYNC_BIN_URL }}/packages/"
 
@@ -239,10 +251,10 @@ jobs:
           cd sdk
           rsync -4 -v --timeout=120 \
             --delay-updates \
-            --partial-dir=".~tmp~${ARCH}" \
+            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
             -a \
-            bin/packages/${ARCH}/ \
-            "${{ vars.RSYNC_BIN_URL }}/packages/${ARCH}/"
+            bin/packages/${{ steps.parse.outputs.arch }}/ \
+            "${{ vars.RSYNC_BIN_URL }}/packages/${{ steps.parse.outputs.arch }}/"
 
       - name: Prune old packages
         if: ${{ vars.RSYNC_BIN_URL != '' }}
@@ -255,10 +267,10 @@ jobs:
             --existing \
             --ignore-existing \
             --delay-updates \
-            --partial-dir=".~tmp~${ARCH}" \
+            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
             -a \
-            bin/packages/${ARCH}/ \
-            "${{ vars.RSYNC_BIN_URL }}/packages/${ARCH}/"
+            bin/packages/${{ steps.parse.outputs.arch }}/ \
+            "${{ vars.RSYNC_BIN_URL }}/packages/${{ steps.parse.outputs.arch }}/"
 
       - name: Collect failure logs
         if: always()
@@ -282,9 +294,9 @@ jobs:
           cd sdk
           # Create target directory
           rsync -4 -v --timeout=120 -a \
-            --include "/${ARCH}/" \
+            --include "/${{ steps.parse.outputs.arch }}/" \
             --exclude "/*" \
-            --exclude "/${ARCH}/*" \
+            --exclude "/${{ steps.parse.outputs.arch }}/*" \
             bin/packages/ \
             "${{ vars.RSYNC_BIN_URL }}/faillogs/" || true
 
@@ -292,10 +304,10 @@ jobs:
           rsync -4 -v --timeout=120 \
             --delete \
             --delay-updates \
-            --partial-dir=".~tmp~${ARCH}" \
+            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
             -az \
             faillogs/ \
-            "${{ vars.RSYNC_BIN_URL }}/faillogs/${ARCH}/" || true
+            "${{ vars.RSYNC_BIN_URL }}/faillogs/${{ steps.parse.outputs.arch }}/" || true
 
       - name: Upload source archives
         if: ${{ vars.RSYNC_SRC_URL != '' }}
@@ -312,7 +324,7 @@ jobs:
               --files-from=sourcelist \
               --size-only \
               --delay-updates \
-              --partial-dir=".~tmp~${ARCH}" \
+              --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
               -a \
               dl/ \
               "${{ vars.RSYNC_SRC_URL }}/" || true

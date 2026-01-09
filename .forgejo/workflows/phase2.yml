@@ -1,0 +1,323 @@
+name: Phase2 Package Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # Run every 6 hours to pick up feed changes
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: 'Build specific architecture (or "all" for all architectures)'
+        required: false
+        default: 'all'
+      openwrt_branch:
+        description: 'OpenWrt branch to use'
+        required: false
+        default: 'main'
+
+env:
+  OPENWRT_REPO: https://git.openwrt.org/openwrt/openwrt.git
+  OPENWRT_BRANCH: ${{ inputs.openwrt_branch || 'main' }}
+  DOWNLOAD_BASE: https://downloads.openwrt.org/snapshots/targets
+
+jobs:
+  discover-targets:
+    name: Discover build targets
+    runs-on: self-hosted
+    outputs:
+      architectures: ${{ steps.get-arches.outputs.architectures }}
+    steps:
+      - name: Checkout buildbot repo
+        uses: actions/checkout@v4
+
+      - name: Clone OpenWrt source
+        run: |
+          if [ -d openwrt ]; then
+            cd openwrt
+            git fetch origin
+            git checkout origin/${{ env.OPENWRT_BRANCH }}
+          else
+            git clone --depth=1 --branch=${{ env.OPENWRT_BRANCH }} ${{ env.OPENWRT_REPO }} openwrt
+          fi
+
+      - name: Discover architectures
+        id: get-arches
+        run: |
+          cd openwrt
+          mkdir -p tmp
+
+          # Get all architectures: "arch target/subtarget"
+          ./scripts/dump-target-info.pl architectures > tmp/architectures.txt
+
+          # Convert to JSON array for matrix
+          # Format: [{"arch": "aarch64_cortex-a53", "target": "qualcommax", "subtarget": "ipq807x"}, ...]
+          ARCHES_JSON=$(awk '{
+            split($2, ts, "/");
+            printf "{\"arch\": \"%s\", \"target\": \"%s\", \"subtarget\": \"%s\"}\n", $1, ts[1], ts[2]
+          }' tmp/architectures.txt | jq -s -c '.')
+
+          echo "Found architectures:"
+          echo "$ARCHES_JSON" | jq .
+
+          # Filter if specific architecture requested
+          if [ "${{ inputs.architecture }}" != "all" ] && [ -n "${{ inputs.architecture }}" ]; then
+            ARCHES_JSON=$(echo "$ARCHES_JSON" | jq -c '[.[] | select(.arch == "${{ inputs.architecture }}")]')
+            echo "Filtered to: $ARCHES_JSON"
+          fi
+
+          echo "architectures=$ARCHES_JSON" >> "$GITHUB_OUTPUT"
+
+  build-packages:
+    name: Build ${{ matrix.arch.arch }}
+    needs: discover-targets
+    runs-on: self-hosted
+    strategy:
+      matrix:
+        arch: ${{ fromJson(needs.discover-targets.outputs.architectures) }}
+      fail-fast: false
+      max-parallel: 4
+
+    env:
+      ARCH: ${{ matrix.arch.arch }}
+      TARGET: ${{ matrix.arch.target }}
+      SUBTARGET: ${{ matrix.arch.subtarget }}
+
+    steps:
+      - name: Checkout buildbot repo
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          echo "Building packages for $ARCH ($TARGET/$SUBTARGET)"
+          mkdir -p sdk
+          mkdir -p "$HOME/dl"
+
+      - name: Download SDK
+        run: |
+          SDK_URL="${{ env.DOWNLOAD_BASE }}/${TARGET}/${SUBTARGET}"
+          echo "Looking for SDK at: $SDK_URL"
+
+          # Find SDK filename
+          SDK_FILE=$(curl -s "${SDK_URL}/sha256sums" | grep -oP 'openwrt-sdk-[^*]+\.tar\.\w+' | head -1)
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "ERROR: Could not find SDK file in sha256sums"
+            exit 1
+          fi
+
+          echo "Downloading SDK: $SDK_FILE"
+          curl -L -o sdk.archive "${SDK_URL}/${SDK_FILE}"
+
+          # Verify download
+          if [ ! -s sdk.archive ]; then
+            echo "ERROR: SDK download failed or empty"
+            exit 1
+          fi
+
+          echo "SDK downloaded successfully: $(ls -lh sdk.archive)"
+
+      - name: Unpack SDK
+        run: |
+          rm -rf sdk_update
+          mkdir sdk_update
+          tar --strip-components=1 -C sdk_update/ -xf sdk.archive
+          rsync -a --checksum sdk_update/ sdk/
+          rm -rf sdk_update
+
+      - name: Sanitize host command symlinks
+        run: |
+          find sdk/staging_dir/host/bin/ -type l -exec sh -c '
+            case $(readlink {}) in
+              /bin/*|/usr/bin/*) true;;
+              /*) rm -vf {};;
+            esac
+          ' \;
+
+      - name: Get SDK version
+        id: sdk-version
+        run: |
+          cd sdk
+          cat > getversion.mk << 'EOF'
+          TOPDIR:=${CURDIR}
+          include $(TOPDIR)/include/version.mk
+          version:
+          	@echo $(VERSION_NUMBER)
+          EOF
+          VERSION=$(make -f getversion.mk)
+          echo "SDK version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup download directory
+        run: |
+          mkdir -p "$HOME/dl"
+          rm -rf sdk/dl
+          ln -sf "$HOME/dl" sdk/dl
+
+      - name: Configure SDK
+        run: |
+          cd sdk
+          rm -f .config
+          make defconfig
+
+      - name: Setup ccache
+        run: |
+          cd sdk
+          ../scripts/ccache.sh
+
+      - name: Update feeds
+        run: |
+          cd sdk
+          ./scripts/feeds update -f
+
+      - name: Install feeds
+        run: |
+          cd sdk
+          ./scripts/feeds install -a
+
+      - name: Generate feeds.conf
+        run: |
+          cd sdk
+          ./scripts/feeds list -s -f > bin/packages/${ARCH}/feeds.conf || mkdir -p bin/packages/${ARCH}
+          ./scripts/feeds list -s -f > bin/packages/${ARCH}/feeds.conf
+
+      - name: Clear previous logs
+        run: |
+          cd sdk
+          rm -rf logs/package/error.txt faillogs/
+
+      - name: Build packages
+        run: |
+          cd sdk
+          make -j$(nproc) \
+            IGNORE_ERRORS="n m y" \
+            BUILD_LOG=1 \
+            CONFIG_AUTOREMOVE=y \
+            CONFIG_SIGNED_PACKAGES= \
+            V=s
+
+      - name: Calculate checksums
+        run: |
+          cd sdk/bin/packages/${ARCH}
+          find . -type f -not -name 'sha256sums' -printf '%P\n' | \
+            sort | \
+            xargs -r ../../staging_dir/host/bin/mkhash -n sha256 | \
+            sed -ne 's!^\(.*\) \(.*\)$!\1 *\2!p' > sha256sums
+
+      - name: Prepare package upload
+        if: ${{ vars.RSYNC_BIN_URL != '' }}
+        env:
+          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+        run: |
+          cd sdk
+          # Create target directory structure
+          rsync -4 -v --timeout=120 -a \
+            --include "/${ARCH}/" \
+            --exclude "/*" \
+            --exclude "/${ARCH}/*" \
+            bin/packages/ \
+            "${{ vars.RSYNC_BIN_URL }}/packages/"
+
+      - name: Upload packages
+        if: ${{ vars.RSYNC_BIN_URL != '' }}
+        env:
+          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+        run: |
+          cd sdk
+          rsync -4 -v --timeout=120 \
+            --delay-updates \
+            --partial-dir=".~tmp~${ARCH}" \
+            -a \
+            bin/packages/${ARCH}/ \
+            "${{ vars.RSYNC_BIN_URL }}/packages/${ARCH}/"
+
+      - name: Prune old packages
+        if: ${{ vars.RSYNC_BIN_URL != '' }}
+        env:
+          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+        run: |
+          cd sdk
+          rsync -4 -v --timeout=120 \
+            --delete \
+            --existing \
+            --ignore-existing \
+            --delay-updates \
+            --partial-dir=".~tmp~${ARCH}" \
+            -a \
+            bin/packages/${ARCH}/ \
+            "${{ vars.RSYNC_BIN_URL }}/packages/${ARCH}/"
+
+      - name: Collect failure logs
+        if: always()
+        run: |
+          cd sdk
+          mkdir -p faillogs
+          if [ -f logs/package/error.txt ]; then
+            sed -ne 's!^ *ERROR: package/feeds/\([^ ]*\) .*$!\1!p' logs/package/error.txt | \
+              sort -u | \
+              xargs -r find logs/package/feeds/ 2>/dev/null > logs.txt || true
+            if [ -s logs.txt ]; then
+              rsync -a --files-from=logs.txt logs/package/feeds/ faillogs/ || true
+            fi
+          fi
+
+      - name: Upload failure logs
+        if: ${{ always() && vars.RSYNC_BIN_URL != '' }}
+        env:
+          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+        run: |
+          cd sdk
+          # Create target directory
+          rsync -4 -v --timeout=120 -a \
+            --include "/${ARCH}/" \
+            --exclude "/*" \
+            --exclude "/${ARCH}/*" \
+            bin/packages/ \
+            "${{ vars.RSYNC_BIN_URL }}/faillogs/" || true
+
+          # Upload logs
+          rsync -4 -v --timeout=120 \
+            --delete \
+            --delay-updates \
+            --partial-dir=".~tmp~${ARCH}" \
+            -az \
+            faillogs/ \
+            "${{ vars.RSYNC_BIN_URL }}/faillogs/${ARCH}/" || true
+
+      - name: Upload source archives
+        if: ${{ vars.RSYNC_SRC_URL != '' }}
+        env:
+          RSYNC_PASSWORD: ${{ secrets.RSYNC_SRC_PASSWORD }}
+        run: |
+          cd sdk
+          find dl/ -maxdepth 1 -type f -not -size 0 \
+            -not -name '.*' -not -name '*.hash' -not -name '*.dl' \
+            -newer ../sdk.archive -printf '%f\n' > sourcelist || true
+
+          if [ -s sourcelist ]; then
+            rsync -4 -v --timeout=120 \
+              --files-from=sourcelist \
+              --size-only \
+              --delay-updates \
+              --partial-dir=".~tmp~${ARCH}" \
+              -a \
+              dl/ \
+              "${{ vars.RSYNC_SRC_URL }}/" || true
+          fi
+
+      - name: Report disk usage
+        if: always()
+        run: |
+          echo "=== Disk Usage ==="
+          df -h .
+          echo ""
+          echo "=== Directory Size ==="
+          du -sh .
+
+      - name: Report ccache stats
+        if: always()
+        run: |
+          ccache -s 2>/dev/null || true

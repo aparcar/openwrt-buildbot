@@ -359,48 +359,29 @@ jobs:
           cd sdk/
           make package/index V=s
 
-      - name: Prepare package upload
-        if: ${{ vars.RSYNC_BIN_URL != '' }}
-        env:
-          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+      - name: Setup SSH key
+        if: ${{ secrets.SSH_PRIVATE_KEY != '' && secrets.RSYNC_SERVER != '' }}
         run: |
-          cd sdk
-          # Create target directory structure
-          rsync -4 -v --timeout=120 -a \
-            --include "/${{ steps.parse.outputs.arch }}/" \
-            --exclude "/*" \
-            --exclude "/${{ steps.parse.outputs.arch }}/*" \
-            bin/packages/ \
-            "${{ vars.RSYNC_BIN_URL }}/packages/"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p ${{ secrets.RSYNC_PORT || '22' }} ${{ secrets.RSYNC_SERVER }} >> ~/.ssh/known_hosts
 
-      - name: Upload packages
-        if: ${{ vars.RSYNC_BIN_URL != '' }}
-        env:
-          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+      - name: Upload packages via SSH
+        if: ${{ secrets.SSH_PRIVATE_KEY != '' && secrets.RSYNC_SERVER != '' }}
         run: |
           cd sdk
-          rsync -4 -v --timeout=120 \
-            --delay-updates \
-            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
-            -a \
+          # Create remote directory structure
+          ssh -p ${{ secrets.RSYNC_PORT || '22' }} ${{ secrets.RSYNC_USER }}@${{ secrets.RSYNC_SERVER }} \
+            "mkdir -p packages/${{ steps.parse.outputs.arch }}"
+          
+          # Upload packages using rsync over SSH
+          rsync -avz --progress \
+            -e "ssh -p ${{ secrets.RSYNC_PORT || '22' }}" \
             bin/packages/${{ steps.parse.outputs.arch }}/ \
-            "${{ vars.RSYNC_BIN_URL }}/packages/${{ steps.parse.outputs.arch }}/"
-
-      - name: Prune old packages
-        if: ${{ vars.RSYNC_BIN_URL != '' }}
-        env:
-          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
-        run: |
-          cd sdk
-          rsync -4 -v --timeout=120 \
-            --delete \
-            --existing \
-            --ignore-existing \
-            --delay-updates \
-            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
-            -a \
-            bin/packages/${{ steps.parse.outputs.arch }}/ \
-            "${{ vars.RSYNC_BIN_URL }}/packages/${{ steps.parse.outputs.arch }}/"
+            ${{ secrets.RSYNC_USER }}@${{ secrets.RSYNC_SERVER }}:packages/${{ steps.parse.outputs.arch }}/
+          
+          echo "Packages uploaded successfully"
 
       - name: Collect failure logs
         if: always()
@@ -416,48 +397,24 @@ jobs:
             fi
           fi
 
-      - name: Upload failure logs
-        if: ${{ always() && vars.RSYNC_BIN_URL != '' }}
-        env:
-          RSYNC_PASSWORD: ${{ secrets.RSYNC_BIN_PASSWORD }}
+      - name: Upload failure logs via SSH
+        if: ${{ always() && secrets.SSH_PRIVATE_KEY != '' && secrets.RSYNC_SERVER != '' }}
         run: |
           cd sdk
-          # Create target directory
-          rsync -4 -v --timeout=120 -a \
-            --include "/${{ steps.parse.outputs.arch }}/" \
-            --exclude "/*" \
-            --exclude "/${{ steps.parse.outputs.arch }}/*" \
-            bin/packages/ \
-            "${{ vars.RSYNC_BIN_URL }}/faillogs/" || true
-
-          # Upload logs
-          rsync -4 -v --timeout=120 \
-            --delete \
-            --delay-updates \
-            --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
-            -az \
-            faillogs/ \
-            "${{ vars.RSYNC_BIN_URL }}/faillogs/${{ steps.parse.outputs.arch }}/" || true
-
-      - name: Upload source archives
-        if: ${{ vars.RSYNC_SRC_URL != '' }}
-        env:
-          RSYNC_PASSWORD: ${{ secrets.RSYNC_SRC_PASSWORD }}
-        run: |
-          cd sdk
-          find dl/ -maxdepth 1 -type f -not -size 0 \
-            -not -name '.*' -not -name '*.hash' -not -name '*.dl' \
-            -newer ../sdk.archive -printf '%f\n' > sourcelist || true
-
-          if [ -s sourcelist ]; then
-            rsync -4 -v --timeout=120 \
-              --files-from=sourcelist \
-              --size-only \
-              --delay-updates \
-              --partial-dir=".~tmp~${{ steps.parse.outputs.arch }}" \
-              -a \
-              dl/ \
-              "${{ vars.RSYNC_SRC_URL }}/" || true
+          if [ -d faillogs ] && [ "$(ls -A faillogs)" ]; then
+            # Create remote directory
+            ssh -p ${{ secrets.RSYNC_PORT || '22' }} ${{ secrets.RSYNC_USER }}@${{ secrets.RSYNC_SERVER }} \
+              "mkdir -p faillogs/${{ steps.parse.outputs.arch }}" || true
+            
+            # Upload failure logs
+            rsync -avz --progress \
+              -e "ssh -p ${{ secrets.RSYNC_PORT || '22' }}" \
+              faillogs/ \
+              ${{ secrets.RSYNC_USER }}@${{ secrets.RSYNC_SERVER }}:faillogs/${{ steps.parse.outputs.arch }}/ || true
+            
+            echo "Failure logs uploaded"
+          else
+            echo "No failure logs to upload"
           fi
 
       - name: Report disk usage

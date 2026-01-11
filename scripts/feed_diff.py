@@ -145,12 +145,12 @@ def main():
     print(f"New feeds: {new}", file=sys.stderr)
     print(f"Removed feeds: {removed}", file=sys.stderr)
     
-    # Check if base feed changed FIRST (always trigger full rebuild)
-    # This must be checked before the threshold check
-    if 'base' in changed or 'base' in new:
-        print("Info: Base feed changed - triggering full rebuild", file=sys.stderr)
-        print("ALL")
-        sys.exit(3)
+    # Base feed changes are treated like any other feed change
+    # A smarter dependency model will be implemented later
+    # if 'base' in changed or 'base' in new:
+    #     print("Info: Base feed changed - triggering full rebuild", file=sys.stderr)
+    #     print("ALL")
+    #     sys.exit(3)
     
     # Check if no changes
     if not affected:
